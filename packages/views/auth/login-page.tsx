@@ -35,6 +35,14 @@ interface GoogleAuthConfig {
   state?: string;
 }
 
+interface GiteaAuthConfig {
+  authUrl: string;
+  clientId: string;
+  redirectUri: string;
+  /** Opaque state passed through Gitea OAuth. */
+  state?: string;
+}
+
 interface CliCallbackConfig {
   /** Validated localhost callback URL */
   url: string;
@@ -50,6 +58,8 @@ interface LoginPageProps {
   onSuccess: () => void;
   /** Google OAuth config. Omit to disable Google login. */
   google?: GoogleAuthConfig;
+  /** Self-hosted Gitea OAuth config. Omit to disable Gitea login. */
+  gitea?: GiteaAuthConfig;
   /** CLI callback config for authorizing CLI tools. */
   cliCallback?: CliCallbackConfig;
   /** Called after a token is obtained (e.g. to set cookies). */
@@ -101,6 +111,7 @@ export function LoginPage({
   logo,
   onSuccess,
   google,
+  gitea,
   cliCallback,
   onTokenObtained,
   onGoogleLogin,
@@ -286,6 +297,18 @@ export function LoginPage({
     window.location.href = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
   };
 
+  const handleGiteaLogin = () => {
+    if (!gitea) return;
+    const params = new URLSearchParams({
+      client_id: gitea.clientId,
+      redirect_uri: gitea.redirectUri,
+      response_type: "code",
+      scope: "read:user",
+      state: ["provider:gitea", gitea.state].filter(Boolean).join(","),
+    });
+    window.location.href = `${gitea.authUrl}?${params}`;
+  };
+
   // -------------------------------------------------------------------------
   // CLI confirm step
   // -------------------------------------------------------------------------
@@ -449,7 +472,7 @@ export function LoginPage({
               ? t(($) => $.signin.sending)
               : t(($) => $.signin.continue)}
           </Button>
-          {(google || onGoogleLogin) && (
+          {(google || onGoogleLogin || gitea) && (
             <Button
               type="button"
               variant="outline"
@@ -477,6 +500,21 @@ export function LoginPage({
                 />
               </svg>
               {t(($) => $.signin.google)}
+            </Button>
+          )}
+          {gitea && (
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full"
+              size="lg"
+              onClick={handleGiteaLogin}
+              disabled={loading}
+            >
+              <span className="mr-2 inline-flex h-4 w-4 items-center justify-center rounded bg-muted text-[10px] font-bold">
+                G
+              </span>
+              Gitea
             </Button>
           )}
           {extra && <div className="w-full pt-1 text-center">{extra}</div>}

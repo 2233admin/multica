@@ -61,6 +61,8 @@ function LoginPageContent() {
   const qc = useQueryClient();
   const { t } = useT("auth");
   const googleClientId = useConfigStore((state) => state.googleClientId);
+  const giteaAuthUrl = useConfigStore((state) => state.giteaAuthUrl);
+  const giteaClientId = useConfigStore((state) => state.giteaClientId);
   const user = useAuthStore((s) => s.user);
   const isLoading = useAuthStore((s) => s.isLoading);
   const searchParams = useSearchParams();
@@ -164,6 +166,7 @@ function LoginPageContent() {
   ]
     .filter(Boolean)
     .join(",") || undefined;
+  const giteaState = googleState;
 
   // While the desktop handoff is in progress (or has produced a token/error),
   // render a dedicated screen instead of flashing the login form or redirecting
@@ -224,6 +227,16 @@ function LoginPageContent() {
               clientId: googleClientId,
               redirectUri: `${window.location.origin}/auth/callback`,
               state: googleState,
+            }
+          : undefined
+      }
+      gitea={
+        giteaAuthUrl && giteaClientId
+          ? {
+              authUrl: giteaAuthUrl,
+              clientId: giteaClientId,
+              redirectUri: `${window.location.origin}/auth/callback`,
+              state: giteaState,
             }
           : undefined
       }
