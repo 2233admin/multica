@@ -11,6 +11,7 @@ interface ConfigState {
   googleClientId: string;
   giteaAuthUrl: string;
   giteaClientId: string;
+  giteaRedirectUri: string;
   daemonServerUrl: string;
   daemonAppUrl: string;
   // Self-host gate (#3433): when true, every "Create workspace" affordance
@@ -44,6 +45,7 @@ interface ConfigState {
     googleClientId?: string;
     giteaAuthUrl?: string;
     giteaClientId?: string;
+    giteaRedirectUri?: string;
     workspaceCreationDisabled?: boolean;
     vcsIntegrationAvailable?: boolean;
   }) => void;
@@ -64,6 +66,7 @@ export const configStore = createStore<ConfigState>((set) => ({
   googleClientId: "",
   giteaAuthUrl: "",
   giteaClientId: "",
+  giteaRedirectUri: "",
   daemonServerUrl: "",
   daemonAppUrl: "",
   workspaceCreationDisabled: false,
@@ -78,9 +81,10 @@ export const configStore = createStore<ConfigState>((set) => ({
     googleClientId = "",
     giteaAuthUrl = "",
     giteaClientId = "",
+    giteaRedirectUri = "",
     workspaceCreationDisabled = false,
     vcsIntegrationAvailable = false,
-  }) => set({ allowSignup, googleClientId, giteaAuthUrl, giteaClientId, workspaceCreationDisabled, vcsIntegrationAvailable }),
+  }) => set({ allowSignup, googleClientId, giteaAuthUrl, giteaClientId, giteaRedirectUri, workspaceCreationDisabled, vcsIntegrationAvailable }),
   setDaemonConfig: ({ daemonServerUrl = "", daemonAppUrl = "" }) =>
     set({ daemonServerUrl, daemonAppUrl }),
   setFeatureFlags: (flags = {}) => set({ featureFlags: { ...flags } }),
