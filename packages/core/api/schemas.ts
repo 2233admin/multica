@@ -733,6 +733,7 @@ export interface AppConfigResponse {
   google_client_id?: string;
   gitea_auth_url?: string;
   gitea_client_id?: string;
+  gitea_redirect_uri?: string;
   posthog_key?: string;
   posthog_host?: string;
   analytics_environment?: string;

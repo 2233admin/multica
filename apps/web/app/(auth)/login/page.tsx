@@ -63,6 +63,7 @@ function LoginPageContent() {
   const googleClientId = useConfigStore((state) => state.googleClientId);
   const giteaAuthUrl = useConfigStore((state) => state.giteaAuthUrl);
   const giteaClientId = useConfigStore((state) => state.giteaClientId);
+  const giteaRedirectUri = useConfigStore((state) => state.giteaRedirectUri);
   const user = useAuthStore((s) => s.user);
   const isLoading = useAuthStore((s) => s.isLoading);
   const searchParams = useSearchParams();
@@ -235,7 +236,7 @@ function LoginPageContent() {
           ? {
               authUrl: giteaAuthUrl,
               clientId: giteaClientId,
-              redirectUri: `${window.location.origin}/auth/callback`,
+              redirectUri: giteaRedirectUri || `${window.location.origin}/auth/callback`,
               state: giteaState,
             }
           : undefined
