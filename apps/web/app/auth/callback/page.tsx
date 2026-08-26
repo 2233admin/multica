@@ -8,7 +8,11 @@ import { workspaceKeys } from "@multica/core/workspace/queries";
 import { paths, resolvePostAuthDestination } from "@multica/core/paths";
 import { api } from "@multica/core/api";
 import { createLogger } from "@multica/core/logger";
-import { validateCliCallback, redirectToCliCallback } from "@multica/views/auth";
+import {
+  validateCliCallback,
+  redirectToCliCallback,
+  decodeGiteaOAuthState,
+} from "@multica/views/auth";
 import {
   Card,
   CardHeader,
@@ -52,8 +56,10 @@ function CallbackContent() {
     }
 
     const state = searchParams.get("state") || "";
-    const stateParts = state.split(",");
-    const provider = stateParts.includes("provider:gitea") ? "gitea" : "google";
+    const giteaState = decodeGiteaOAuthState(state);
+    const clientState = giteaState ?? state;
+    const stateParts = clientState.split(",");
+    const provider = giteaState !== null ? "gitea" : "google";
     const isDesktop = stateParts.includes("platform:desktop");
     const nextPart = stateParts.find((p) => p.startsWith("next:"));
     // Strip "next:" prefix, then drop anything that isn't a safe relative path
@@ -73,7 +79,10 @@ function CallbackContent() {
       : "";
 
     const redirectUri = `${window.location.origin}/auth/callback`;
-    const loginWithProvider = provider === "gitea" ? loginWithGitea : loginWithGoogle;
+    const exchangeCode = () =>
+      provider === "gitea"
+        ? api.giteaLogin(code, state)
+        : api.googleLogin(code, redirectUri);
 
     // Validate the CLI callback URL before redirecting — the state parameter
     // passes through Google OAuth and must be treated as attacker-controlled.
@@ -85,8 +94,7 @@ function CallbackContent() {
     if (cliCallback) {
       // CLI login flow: exchange the Google code for a JWT, then redirect the
       // token back to the CLI's local HTTP listener (e.g. WSL2 host).
-      api
-        [provider === "gitea" ? "giteaLogin" : "googleLogin"](code, redirectUri)
+      exchangeCode()
         .then(({ token }) => {
           redirectToCliCallback(cliCallback, token, cliState);
         })
@@ -96,8 +104,7 @@ function CallbackContent() {
         });
     } else if (isDesktop) {
       // Desktop flow: exchange code for token, then redirect via deep link
-      api
-        [provider === "gitea" ? "giteaLogin" : "googleLogin"](code, redirectUri)
+      exchangeCode()
         .then(({ token }) => {
           setDesktopToken(token);
           window.location.href = `multica://auth/callback?token=${encodeURIComponent(token)}`;
@@ -108,7 +115,7 @@ function CallbackContent() {
         });
     } else {
       // Normal web flow
-      loginWithProvider(code, redirectUri)
+      (provider === "gitea" ? loginWithGitea(code, state) : loginWithGoogle(code, redirectUri))
         .then(async (loggedInUser) => {
           const wsList = await api.listWorkspaces();
           qc.setQueryData(workspaceKeys.list(), wsList);

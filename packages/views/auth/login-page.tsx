@@ -36,10 +36,7 @@ interface GoogleAuthConfig {
 }
 
 interface GiteaAuthConfig {
-  authUrl: string;
-  clientId: string;
-  redirectUri: string;
-  /** Opaque state passed through Gitea OAuth. */
+  /** Opaque post-login state signed by the backend during OAuth start. */
   state?: string;
 }
 
@@ -104,6 +101,31 @@ function GiteaLogo() {
 export function redirectToCliCallback(url: string, token: string, state: string) {
   const separator = url.includes("?") ? "&" : "?";
   window.location.href = `${url}${separator}token=${encodeURIComponent(token)}&state=${encodeURIComponent(state)}`;
+}
+
+/**
+ * Decode the routing portion of the backend-issued Gitea state. The backend
+ * verifies the signature and cookie; the browser only needs the non-sensitive
+ * client state to choose the post-login destination.
+ */
+export function decodeGiteaOAuthState(state: string): string | null {
+  try {
+    const encoded = state.split(".", 2)[0];
+    if (!encoded) return null;
+    const padded = encoded.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(encoded.length / 4) * 4, "=");
+    const bytes = Uint8Array.from(atob(padded), (char) => char.charCodeAt(0));
+    const payload = JSON.parse(new TextDecoder().decode(bytes)) as {
+      nonce?: unknown;
+      client_state?: unknown;
+    };
+    return typeof payload.nonce === "string" && payload.nonce
+      ? typeof payload.client_state === "string"
+        ? payload.client_state
+        : ""
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -323,14 +345,10 @@ export function LoginPage({
 
   const handleGiteaLogin = () => {
     if (!gitea) return;
-    const params = new URLSearchParams({
-      client_id: gitea.clientId,
-      redirect_uri: gitea.redirectUri,
-      response_type: "code",
-      scope: "read:user",
-      state: ["provider:gitea", gitea.state].filter(Boolean).join(","),
-    });
-    window.location.href = `${gitea.authUrl}?${params}`;
+    const params = new URLSearchParams();
+    if (gitea.state) params.set("state", gitea.state);
+    const query = params.toString();
+    window.location.href = `${api.getBaseUrl().replace(/\/+$/, "")}/auth/gitea${query ? `?${query}` : ""}`;
   };
 
   // -------------------------------------------------------------------------
@@ -536,7 +554,7 @@ export function LoginPage({
               disabled={loading}
             >
               <GiteaLogo />
-              Gitea
+              {t(($) => $.signin.gitea)}
             </Button>
           )}
           {extra && <div className="w-full pt-1 text-center">{extra}</div>}
