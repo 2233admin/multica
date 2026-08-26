@@ -22,12 +22,11 @@ type AppConfig struct {
 	CdnSigned bool `json:"cdn_signed,omitempty"`
 	// Public auth config consumed by the web app at runtime so self-hosted
 	// deployments do not need to rebuild the frontend image when operators
-	// toggle signup or wire Google/Gitea OAuth.
-	AllowSignup      bool   `json:"allow_signup"`
-	GoogleClientID   string `json:"google_client_id,omitempty"`
-	GiteaAuthURL     string `json:"gitea_auth_url,omitempty"`
-	GiteaClientID    string `json:"gitea_client_id,omitempty"`
-	GiteaRedirectURI string `json:"gitea_redirect_uri,omitempty"`
+	// toggle signup or wire Google/Gitea OAuth. OAuth client secrets never leave
+	// the backend; the Gitea flag is true only when the complete flow is usable.
+	AllowSignup       bool   `json:"allow_signup"`
+	GoogleClientID    string `json:"google_client_id,omitempty"`
+	GiteaLoginEnabled bool   `json:"gitea_login_enabled,omitempty"`
 	// WorkspaceCreationDisabled mirrors the server-side
 	// DISABLE_WORKSPACE_CREATION env var so the UI can hide every
 	// "Create workspace" affordance on self-hosted instances. Omitted
@@ -106,15 +105,11 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 		GoogleClientID:                     os.Getenv("GOOGLE_CLIENT_ID"),
 		WorkspaceCreationDisabled:          os.Getenv("DISABLE_WORKSPACE_CREATION") == "true",
 	}
-	if issuer := strings.TrimRight(strings.TrimSpace(os.Getenv("GITEA_ISSUER_URL")), "/"); issuer != "" {
-		config.GiteaAuthURL = issuer + "/login/oauth/authorize"
-		config.GiteaClientID = strings.TrimSpace(os.Getenv("GITEA_CLIENT_ID"))
-		config.GiteaRedirectURI = strings.TrimRight(strings.TrimSpace(os.Getenv("GITEA_REDIRECT_URI")), "/")
-		if config.GiteaClientID == "" {
-			config.GiteaAuthURL = ""
-			config.GiteaRedirectURI = ""
-		}
-	}
+	_, issuerErr := giteaIssuerURL()
+	_, redirectErr := giteaRedirectURI()
+	config.GiteaLoginEnabled = issuerErr == nil && redirectErr == nil &&
+		strings.TrimSpace(os.Getenv("GITEA_CLIENT_ID")) != "" &&
+		strings.TrimSpace(os.Getenv("GITEA_CLIENT_SECRET")) != ""
 	if h.Storage != nil {
 		config.CdnDomain = h.Storage.CdnDomain()
 	}

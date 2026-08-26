@@ -69,9 +69,7 @@ export function AuthInitializer({
         configStore.getState().setAuthConfig({
           allowSignup: cfg.allow_signup,
           googleClientId: cfg.google_client_id,
-          giteaAuthUrl: cfg.gitea_auth_url,
-          giteaClientId: cfg.gitea_client_id,
-          giteaRedirectUri: cfg.gitea_redirect_uri,
+          giteaLoginEnabled: cfg.gitea_login_enabled === true,
           // Old servers omit this field — treat that as "creation allowed"
           // (the managed-cloud default) rather than blocking the UI.
           workspaceCreationDisabled: cfg.workspace_creation_disabled === true,

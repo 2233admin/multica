@@ -61,9 +61,7 @@ function LoginPageContent() {
   const qc = useQueryClient();
   const { t } = useT("auth");
   const googleClientId = useConfigStore((state) => state.googleClientId);
-  const giteaAuthUrl = useConfigStore((state) => state.giteaAuthUrl);
-  const giteaClientId = useConfigStore((state) => state.giteaClientId);
-  const giteaRedirectUri = useConfigStore((state) => state.giteaRedirectUri);
+  const giteaLoginEnabled = useConfigStore((state) => state.giteaLoginEnabled);
   const user = useAuthStore((s) => s.user);
   const isLoading = useAuthStore((s) => s.isLoading);
   const searchParams = useSearchParams();
@@ -231,16 +229,7 @@ function LoginPageContent() {
             }
           : undefined
       }
-      gitea={
-        giteaAuthUrl && giteaClientId
-          ? {
-              authUrl: giteaAuthUrl,
-              clientId: giteaClientId,
-              redirectUri: giteaRedirectUri || `${window.location.origin}/auth/callback`,
-              state: giteaState,
-            }
-          : undefined
-      }
+      gitea={giteaLoginEnabled ? { state: giteaState } : undefined}
       cliCallback={
         cliCallbackRaw && validateCliCallback(cliCallbackRaw)
           ? { url: cliCallbackRaw, state: cliState }

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -493,8 +492,8 @@ type googleUserInfo struct {
 }
 
 type GiteaLoginRequest struct {
-	Code        string `json:"code"`
-	RedirectURI string `json:"redirect_uri"`
+	Code  string `json:"code"`
+	State string `json:"state"`
 }
 
 type giteaTokenResponse struct {
@@ -503,6 +502,7 @@ type giteaTokenResponse struct {
 }
 
 type giteaUserInfo struct {
+	ID        int64  `json:"id"`
 	Email     string `json:"email"`
 	FullName  string `json:"full_name"`
 	Login     string `json:"login"`
@@ -515,52 +515,29 @@ type giteaEmailInfo struct {
 	Verified bool   `json:"verified"`
 }
 
-func giteaBackendURL(path string) string {
-	override := strings.TrimRight(strings.TrimSpace(os.Getenv("GITEA_BACKEND_HOST_OVERRIDE")), "/")
-	if strings.Contains(override, "://") {
-		return override + path
+// GiteaStart begins an OAuth transaction. The state and PKCE verifier remain
+// server-controlled; the browser only carries the signed state back from
+// Gitea.
+func (h *Handler) GiteaStart(w http.ResponseWriter, r *http.Request) {
+	clientID := strings.TrimSpace(os.Getenv("GITEA_CLIENT_ID"))
+	clientSecret := strings.TrimSpace(os.Getenv("GITEA_CLIENT_SECRET"))
+	issuer, err := giteaIssuerURL()
+	if clientID == "" || clientSecret == "" || err != nil {
+		writeError(w, http.StatusServiceUnavailable, "Gitea login is not configured")
+		return
 	}
-	return strings.TrimRight(strings.TrimSpace(os.Getenv("GITEA_ISSUER_URL")), "/") + path
-}
-
-// giteaHTTPClient supports an optional host override for NAS deployments where
-// the browser-facing Gitea URL is resolved differently from the backend.
-func giteaHTTPClient() *http.Client {
-	override := strings.TrimSpace(os.Getenv("GITEA_BACKEND_HOST_OVERRIDE"))
-	parts := strings.SplitN(override, ":", 2)
-	if len(parts) != 2 || net.ParseIP(strings.TrimSpace(parts[1])) == nil {
-		return &http.Client{Timeout: 15 * time.Second}
+	redirectURI, err := giteaRedirectURI()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
 	}
-
-	baseTransport, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		return &http.Client{Timeout: 15 * time.Second}
+	state, cookieValue, verifier, err := newGiteaOAuthState(r.URL.Query().Get("state"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
-	transport := baseTransport.Clone()
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	ip := strings.TrimSpace(parts[1])
-	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		_, port, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, err
-		}
-		return dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
-	}
-	return &http.Client{Transport: transport, Timeout: 15 * time.Second}
-}
-
-func giteaRedirectURI(requested string) (string, error) {
-	configured := strings.TrimSpace(os.Getenv("GITEA_REDIRECT_URI"))
-	if requested == "" {
-		requested = configured
-	}
-	if requested == "" {
-		return "", errors.New("Gitea redirect URI is not configured")
-	}
-	if configured != "" && requested != configured {
-		return "", errors.New("Gitea redirect URI does not match server configuration")
-	}
-	return requested, nil
+	auth.SetOAuthStateCookie(w, cookieValue, giteaOAuthStateTTL)
+	http.Redirect(w, r, giteaAuthorizeURL(issuer, clientID, redirectURI, state, giteaPKCEChallenge(verifier)), http.StatusFound)
 }
 
 // GiteaLogin exchanges a Gitea OAuth authorization code and then enters the
@@ -578,16 +555,27 @@ func (h *Handler) GiteaLogin(w http.ResponseWriter, r *http.Request) {
 
 	clientID := strings.TrimSpace(os.Getenv("GITEA_CLIENT_ID"))
 	clientSecret := strings.TrimSpace(os.Getenv("GITEA_CLIENT_SECRET"))
-	if clientID == "" || clientSecret == "" || strings.TrimSpace(os.Getenv("GITEA_ISSUER_URL")) == "" {
+	issuer, err := giteaIssuerURL()
+	if clientID == "" || clientSecret == "" || err != nil {
 		writeError(w, http.StatusServiceUnavailable, "Gitea login is not configured")
 		return
 	}
 
-	redirectURI, err := giteaRedirectURI(req.RedirectURI)
+	if strings.TrimSpace(req.State) == "" {
+		writeError(w, http.StatusBadRequest, "state is required")
+		return
+	}
+	verifier, err := validateGiteaOAuthState(r, req.State)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	redirectURI, err := giteaRedirectURI()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	auth.ClearOAuthStateCookie(w)
 
 	tokenRequest, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
 		giteaBackendURL("/login/oauth/access_token"), strings.NewReader(url.Values{
@@ -595,6 +583,7 @@ func (h *Handler) GiteaLogin(w http.ResponseWriter, r *http.Request) {
 			"client_id":     {clientID},
 			"client_secret": {clientSecret},
 			"redirect_uri":  {redirectURI},
+			"code_verifier": {verifier},
 			"grant_type":    {"authorization_code"},
 		}.Encode()))
 	if err != nil {
@@ -660,39 +649,55 @@ func (h *Handler) GiteaLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Gitea may hide the email in /user. Prefer a verified primary address so
-	// the external identity maps to a stable Multica account.
-	if strings.TrimSpace(gUser.Email) == "" {
-		emailsReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, giteaBackendURL("/api/v1/user/emails"), nil)
-		if err == nil {
-			emailsReq.Header.Set("Authorization", "Bearer "+gToken.AccessToken)
-			emailsReq.Header.Set("Accept", "application/json")
-			if emailsResp, requestErr := giteaHTTPClient().Do(emailsReq); requestErr == nil {
-				defer emailsResp.Body.Close()
-				var emails []giteaEmailInfo
-				if emailsResp.StatusCode == http.StatusOK && json.NewDecoder(emailsResp.Body).Decode(&emails) == nil {
-					for _, candidate := range emails {
-						if candidate.Verified && candidate.Primary {
-							gUser.Email = candidate.Email
-							break
-						}
-					}
-					if gUser.Email == "" && len(emails) > 0 {
-						gUser.Email = emails[0].Email
-					}
-				}
-			}
+	// Always require the verified primary email from the provider. The email
+	// is used only for first-time account creation; returning users are looked
+	// up by the stable Gitea subject below.
+	emailsReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, giteaBackendURL("/api/v1/user/emails"), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	emailsReq.Header.Set("Authorization", "Bearer "+gToken.AccessToken)
+	emailsReq.Header.Set("Accept", "application/json")
+	emailsResp, err := giteaHTTPClient().Do(emailsReq)
+	if err != nil {
+		slog.Error("gitea user email fetch failed", "error", err)
+		writeError(w, http.StatusBadGateway, "failed to fetch verified Git email")
+		return
+	}
+	defer emailsResp.Body.Close()
+	if emailsResp.StatusCode != http.StatusOK {
+		writeError(w, http.StatusBadGateway, "Git server did not return verified email data")
+		return
+	}
+	var emails []giteaEmailInfo
+	if err := json.NewDecoder(emailsResp.Body).Decode(&emails); err != nil {
+		writeError(w, http.StatusBadGateway, "failed to parse Git email data")
+		return
+	}
+	for _, candidate := range emails {
+		if candidate.Primary && candidate.Verified {
+			gUser.Email = candidate.Email
+			break
 		}
 	}
 
 	email := strings.ToLower(strings.TrimSpace(gUser.Email))
 	if email == "" {
-		writeError(w, http.StatusBadRequest, "Git account has no email")
+		writeError(w, http.StatusBadRequest, "Git account has no verified primary email")
 		return
 	}
 
-	user, isNew, err := h.findOrCreateUser(r.Context(), email)
+	if gUser.ID <= 0 {
+		writeError(w, http.StatusBadGateway, "Git user response has no stable ID")
+		return
+	}
+	user, isNew, err := h.findOrCreateGiteaUser(r.Context(), issuer.String(), fmt.Sprintf("%d", gUser.ID), email)
 	if err != nil {
+		if errors.Is(err, errGiteaIdentityAlreadyLinked) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		if errors.Is(err, auth.ErrTemporarilyDisabledUser) {
 			writeError(w, http.StatusForbidden, auth.TemporarilyDisabledUserError)
 			return

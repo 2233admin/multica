@@ -776,10 +776,10 @@ export class ApiClient {
     });
   }
 
-  async giteaLogin(code: string, redirectUri: string): Promise<LoginResponse> {
+  async giteaLogin(code: string, state: string): Promise<LoginResponse> {
     return this.fetch("/auth/gitea", {
       method: "POST",
-      body: JSON.stringify({ code, redirect_uri: redirectUri }),
+      body: JSON.stringify({ code, state }),
     });
   }
 
