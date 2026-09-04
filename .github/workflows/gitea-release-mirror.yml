@@ -108,10 +108,27 @@ jobs:
           cd /tmp/assets
           for f in *; do
             echo "uploading $f ..."
-            curl -sk -X POST \
-              -H "Authorization: token ${GITEA_RELEASE_TOKEN}" \
-              "${GITEA_API}/repos/${GITEA_OWNER}/${GITEA_REPO}/releases/${rel_id}/assets?name=${f}" \
-              -F "attachment=@${f}"
+            ok=false
+            for attempt in 1 2 3; do
+              # git.xart.top has shown TLS stalls on unthrottled large multipart
+              # uploads; --limit-rate avoids tripping that and costs little on CI.
+              code="$(curl -sk --max-time 1200 --limit-rate 200k -X POST \
+                -H "Authorization: token ${GITEA_RELEASE_TOKEN}" \
+                "${GITEA_API}/repos/${GITEA_OWNER}/${GITEA_REPO}/releases/${rel_id}/assets?name=${f}" \
+                -F "attachment=@${f}" -o /tmp/upload_resp.json -w '%{http_code}')"
+              if [[ "$code" == "201" ]]; then
+                cat /tmp/upload_resp.json
+                echo
+                ok=true
+                break
+              fi
+              echo "attempt ${attempt} for ${f} failed (http ${code}), retrying..."
+              sleep 10
+            done
+            if [[ "$ok" != "true" ]]; then
+              echo "::error::Failed to upload ${f} after 3 attempts"
+              exit 1
+            fi
           done
 
       - name: Summary
