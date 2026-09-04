@@ -1,0 +1,121 @@
+name: Gitea Release Mirror
+
+on:
+  schedule:
+    - cron: "37 3 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to mirror (default: latest stable multica-ai/multica tag)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      GITEA_API: https://git.xart.top:8418/api/v1
+      GITEA_OWNER: multica-ai
+      GITEA_REPO: multica
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Add upstream remote and fetch tags
+        run: |
+          git remote add upstream https://github.com/multica-ai/multica.git
+          git fetch upstream --tags
+
+      - name: Select tag
+        id: select-tag
+        run: |
+          tag="${{ github.event.inputs.tag }}"
+          if [[ -z "$tag" ]]; then
+            tag="$(git tag -l 'v*.*.*' --sort=-v:refname | grep -v -- '-' | head -n1)"
+          fi
+          if [[ -z "$tag" ]]; then
+            echo "::error::Could not resolve an upstream tag."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check for existing Gitea release
+        id: check-existing
+        env:
+          GITEA_RELEASE_TOKEN: ${{ secrets.GITEA_RELEASE_TOKEN }}
+        run: |
+          tag="${{ steps.select-tag.outputs.tag }}"
+          status="$(curl -sk -o /tmp/existing.json -w '%{http_code}' \
+            -H "Authorization: token ${GITEA_RELEASE_TOKEN}" \
+            "${GITEA_API}/repos/${GITEA_OWNER}/${GITEA_REPO}/releases/tags/${tag}")"
+          if [[ "$status" == "200" ]]; then
+            asset_count="$(jq '.assets | length' /tmp/existing.json)"
+            if [[ "$asset_count" -ge 1 ]]; then
+              echo "::notice::Gitea release ${tag} already exists with ${asset_count} assets, skipping."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "release_id=" >> "$GITHUB_OUTPUT"
+            else
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "release_id=$(jq -r '.id' /tmp/existing.json)" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "release_id=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download upstream release assets
+        if: steps.check-existing.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.select-tag.outputs.tag }}"
+          mkdir -p /tmp/assets
+          gh release download "$tag" -R multica-ai/multica -D /tmp/assets \
+            -p "multica-cli-*" -p "checksums.txt"
+          ls -la /tmp/assets
+
+      - name: Create Gitea release
+        if: steps.check-existing.outputs.skip != 'true' && steps.check-existing.outputs.release_id == ''
+        id: create-release
+        env:
+          GITEA_RELEASE_TOKEN: ${{ secrets.GITEA_RELEASE_TOKEN }}
+        run: |
+          tag="${{ steps.select-tag.outputs.tag }}"
+          body="$(jq -n --arg t "$tag" '{tag_name:$t,target_commitish:"main",name:$t,body:("Mirrored CLI release assets from upstream multica-ai/multica " + $t + " GitHub release."),draft:false,prerelease:false}')"
+          resp="$(curl -sk -X POST \
+            -H "Authorization: token ${GITEA_RELEASE_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${GITEA_API}/repos/${GITEA_OWNER}/${GITEA_REPO}/releases" \
+            -d "$body")"
+          echo "$resp"
+          echo "release_id=$(echo "$resp" | jq -r '.id')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload assets to Gitea release
+        if: steps.check-existing.outputs.skip != 'true'
+        env:
+          GITEA_RELEASE_TOKEN: ${{ secrets.GITEA_RELEASE_TOKEN }}
+        run: |
+          rel_id="${{ steps.create-release.outputs.release_id }}"
+          if [[ -z "$rel_id" ]]; then
+            rel_id="${{ steps.check-existing.outputs.release_id }}"
+          fi
+          cd /tmp/assets
+          for f in *; do
+            echo "uploading $f ..."
+            curl -sk -X POST \
+              -H "Authorization: token ${GITEA_RELEASE_TOKEN}" \
+              "${GITEA_API}/repos/${GITEA_OWNER}/${GITEA_REPO}/releases/${rel_id}/assets?name=${f}" \
+              -F "attachment=@${f}"
+          done
+
+      - name: Summary
+        if: steps.check-existing.outputs.skip != 'true'
+        run: |
+          tag="${{ steps.select-tag.outputs.tag }}"
+          echo "::notice::Mirrored ${tag} CLI assets to ${GITEA_API}/repos/${GITEA_OWNER}/${GITEA_REPO}/releases"
