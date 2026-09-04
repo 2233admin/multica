@@ -1,0 +1,167 @@
+name: Gitea Login Patch Rebuild
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to rebase onto (default: latest stable multica-ai/multica tag)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.select-tag.outputs.tag }}
+      skip: ${{ steps.check-existing.outputs.skip }}
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: git config user.name "gitea-login-bot" && git config user.email "gitea-login-bot@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch tags
+        run: |
+          git remote add upstream https://github.com/multica-ai/multica.git
+          git fetch upstream --tags
+          git fetch origin gitea-login-patches
+
+      - name: Select tag
+        id: select-tag
+        run: |
+          tag="${{ github.event.inputs.tag }}"
+          if [[ -z "$tag" ]]; then
+            tag="$(git tag -l 'v*.*.*' --sort=-v:refname | grep -v -- '-' | head -n1)"
+          fi
+          if [[ -z "$tag" ]]; then
+            echo "::error::Could not resolve an upstream tag."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check for existing images
+        id: check-existing
+        run: |
+          tag="${{ steps.select-tag.outputs.tag }}"
+          if docker manifest inspect "ghcr.io/${{ github.repository_owner }}/multica-backend:${tag}-gitea" >/dev/null 2>&1; then
+            echo "::notice::Images for ${tag}-gitea already exist, skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebase patch branch onto tag
+        if: steps.check-existing.outputs.skip != 'true'
+        id: rebase
+        run: |
+          tag="${{ steps.select-tag.outputs.tag }}"
+          base="$(git merge-base upstream/main origin/gitea-login-patches)"
+          git checkout -b "rebuild-${tag}" origin/gitea-login-patches
+          if ! git rebase --onto "$tag" "$base" "rebuild-${tag}"; then
+            git rebase --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          git push --force-with-lease origin "HEAD:gitea-login-patches"
+          git tag -f "${tag}-gitea"
+          git push origin "refs/tags/${tag}-gitea" --force
+
+      - name: File conflict issue
+        if: failure() && steps.rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.select-tag.outputs.tag }}"
+          title="gitea-login rebase conflict on ${tag}"
+          files="$(git diff --name-only --diff-filter=U)"
+          body=$'Rebasing `gitea-login-patches` onto `'"${tag}"$'` hit a conflict.\n\nConflicting files:\n```\n'"${files}"$'\n```\n\nResolve manually and re-run the workflow.'
+          existing="$(gh issue list --search "in:title \"$title\"" --state open --json number --jq '.[0].number')"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+
+      - name: Compute backend image labels
+        if: steps.check-existing.outputs.skip != 'true'
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/multica-backend
+          labels: |
+            org.opencontainers.image.title=Multica Backend (Gitea login patch)
+            org.opencontainers.image.description=Multica self-hosted backend with Gitea OAuth login patch
+
+      - name: Compute web image labels
+        if: steps.check-existing.outputs.skip != 'true'
+        id: meta-web
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/multica-web
+          labels: |
+            org.opencontainers.image.title=Multica Web (Gitea login patch)
+            org.opencontainers.image.description=Multica self-hosted web frontend with Gitea OAuth login patch
+
+      - name: Setup Docker Buildx
+        if: steps.check-existing.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: steps.check-existing.outputs.skip != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend image
+        if: steps.check-existing.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          pull: true
+          platforms: linux/amd64
+          push: true
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.select-tag.outputs.tag }}
+            COMMIT=${{ github.sha }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/multica-backend:${{ steps.select-tag.outputs.tag }}-gitea
+            ghcr.io/${{ github.repository_owner }}/multica-backend:gitea-latest
+
+      - name: Build and push web image
+        if: steps.check-existing.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.web
+          pull: true
+          platforms: linux/amd64
+          push: true
+          labels: ${{ steps.meta-web.outputs.labels }}
+          build-args: |
+            REMOTE_API_URL=http://backend:8080
+            NEXT_PUBLIC_APP_VERSION=${{ steps.select-tag.outputs.tag }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/multica-web:${{ steps.select-tag.outputs.tag }}-gitea
+            ghcr.io/${{ github.repository_owner }}/multica-web:gitea-latest
+
+      - name: Summary
+        if: steps.check-existing.outputs.skip != 'true'
+        run: |
+          tag="${{ steps.select-tag.outputs.tag }}"
+          echo "::notice::Built ghcr.io/${{ github.repository_owner }}/multica-backend:${tag}-gitea and ghcr.io/${{ github.repository_owner }}/multica-web:${tag}-gitea"
+          echo "::notice::gitea-login-patches HEAD: $(git rev-parse HEAD)"
