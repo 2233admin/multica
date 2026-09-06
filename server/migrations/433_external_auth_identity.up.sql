@@ -3,15 +3,10 @@
 -- self-hosted Gitea installations can reuse numeric user IDs.
 CREATE TABLE external_auth_identity (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES "user" (id) ON DELETE CASCADE,
+    user_id UUID NOT NULL,
     provider TEXT NOT NULL,
     issuer TEXT NOT NULL,
     subject TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (provider, issuer, subject),
-    UNIQUE (user_id, provider, issuer)
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE INDEX external_auth_identity_user_id_idx
-    ON external_auth_identity (user_id);

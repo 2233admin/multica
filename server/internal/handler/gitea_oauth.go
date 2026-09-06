@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -17,6 +18,11 @@ import (
 )
 
 const giteaOAuthStateTTL = 10 * time.Minute
+
+var (
+	errGiteaPrimaryEmailUnavailable = errors.New("failed to fetch verified Git email")
+	errGiteaNoVerifiedPrimaryEmail  = errors.New("Git account has no verified primary email")
+)
 
 type giteaOAuthStatePayload struct {
 	Nonce       string `json:"nonce"`
@@ -68,6 +74,38 @@ func giteaBackendURL(path string) string {
 
 func giteaHTTPClient() *http.Client {
 	return &http.Client{Timeout: 15 * time.Second}
+}
+
+func fetchGiteaPrimaryEmail(ctx context.Context, accessToken string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, giteaBackendURL("/api/v1/user/emails"), nil)
+	if err != nil {
+		return "", errGiteaPrimaryEmailUnavailable
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := giteaHTTPClient().Do(req)
+	if err != nil {
+		return "", errGiteaPrimaryEmailUnavailable
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", errGiteaPrimaryEmailUnavailable
+	}
+
+	var emails []giteaEmailInfo
+	if err := json.NewDecoder(resp.Body).Decode(&emails); err != nil {
+		return "", errGiteaPrimaryEmailUnavailable
+	}
+	for _, candidate := range emails {
+		if candidate.Primary && candidate.Verified {
+			email := strings.ToLower(strings.TrimSpace(candidate.Email))
+			if email != "" {
+				return email, nil
+			}
+		}
+	}
+	return "", errGiteaNoVerifiedPrimaryEmail
 }
 
 func randomURLToken(size int) (string, error) {

@@ -1,6 +1,9 @@
 package handler
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -35,6 +38,48 @@ func TestGiteaBackendURLUsesIssuer(t *testing.T) {
 
 	if got := giteaBackendURL("/api/v1/user"); got != "http://gitea.local/api/v1/user" {
 		t.Fatalf("backend URL = %q", got)
+	}
+}
+
+func TestFetchGiteaPrimaryEmailUsesVerifiedPrimary(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/user/emails" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer access-token" {
+			t.Fatalf("authorization header = %q", r.Header.Get("Authorization"))
+		}
+		_ = json.NewEncoder(w).Encode([]giteaEmailInfo{
+			{Email: "unverified@example.com", Primary: true, Verified: false},
+			{Email: "secondary@example.com", Primary: false, Verified: true},
+			{Email: "Primary@example.com", Primary: true, Verified: true},
+		})
+	}))
+	defer server.Close()
+	t.Setenv("GITEA_ISSUER_URL", server.URL)
+
+	got, err := fetchGiteaPrimaryEmail(context.Background(), "access-token")
+	if err != nil {
+		t.Fatalf("fetchGiteaPrimaryEmail returned error: %v", err)
+	}
+	if got != "primary@example.com" {
+		t.Fatalf("primary email = %q, want primary@example.com", got)
+	}
+}
+
+func TestFetchGiteaPrimaryEmailRejectsMissingVerifiedPrimary(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]giteaEmailInfo{
+			{Email: "unverified@example.com", Primary: true, Verified: false},
+		})
+	}))
+	defer server.Close()
+	t.Setenv("GITEA_ISSUER_URL", server.URL)
+
+	_, err := fetchGiteaPrimaryEmail(context.Background(), "access-token")
+	if !errors.Is(err, errGiteaNoVerifiedPrimaryEmail) {
+		t.Fatalf("error = %v, want errGiteaNoVerifiedPrimaryEmail", err)
 	}
 }
 

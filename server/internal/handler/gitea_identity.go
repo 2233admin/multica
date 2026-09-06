@@ -10,7 +10,7 @@ import (
 
 var errGiteaIdentityAlreadyLinked = errors.New("Gitea identity is already linked to another Multica user")
 
-func (h *Handler) findOrCreateGiteaUser(ctx context.Context, issuer, subject, email string) (db.User, bool, error) {
+func (h *Handler) findGiteaUserByIdentity(ctx context.Context, issuer, subject string) (db.User, error) {
 	identity, err := h.Queries.GetExternalAuthIdentity(ctx, db.GetExternalAuthIdentityParams{
 		Provider: "gitea",
 		Issuer:   issuer,
@@ -19,11 +19,19 @@ func (h *Handler) findOrCreateGiteaUser(ctx context.Context, issuer, subject, em
 	if err == nil {
 		user, userErr := h.Queries.GetUser(ctx, identity.UserID)
 		if userErr != nil {
-			return db.User{}, false, userErr
+			return db.User{}, userErr
 		}
 		if auth.IsTemporarilyDisabledUser(uuidToString(user.ID), user.Email) {
-			return db.User{}, false, auth.ErrTemporarilyDisabledUser
+			return db.User{}, auth.ErrTemporarilyDisabledUser
 		}
+		return user, nil
+	}
+	return db.User{}, err
+}
+
+func (h *Handler) findOrCreateGiteaUser(ctx context.Context, issuer, subject, email string) (db.User, bool, error) {
+	user, err := h.findGiteaUserByIdentity(ctx, issuer, subject)
+	if err == nil {
 		return user, false, nil
 	}
 	if !isNotFound(err) {
