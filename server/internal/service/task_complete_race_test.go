@@ -110,7 +110,7 @@ func TestCompleteTask_AlreadyFinalized(t *testing.T) {
 				Bus:     events.New(),
 			}
 
-			got, err := svc.CompleteTask(context.Background(), taskID, nil, "", "", "", false, "")
+			got, err := svc.CompleteTask(context.Background(), taskID, nil, "", "", "", false, "", "")
 			if err != nil {
 				t.Fatalf("expected no error, got %v", err)
 			}
@@ -152,7 +152,7 @@ func TestFailTask_AlreadyFinalized(t *testing.T) {
 				Bus:     events.New(),
 			}
 
-			got, err := svc.FailTask(context.Background(), taskID, "agent crashed", "", "", "", "", false, "")
+			got, err := svc.FailTask(context.Background(), taskID, "agent crashed", "", "", "", "", false, "", "")
 			if err != nil {
 				t.Fatalf("expected no error, got %v", err)
 			}
@@ -302,6 +302,27 @@ func TestRuntimeCLITimeoutIsNotAutoRetried(t *testing.T) {
 	}
 	if !retryableReasons["agent_error.provider_network"] {
 		t.Error("agent_error.provider_network must stay retryable: real provider stalls are transient")
+	}
+}
+
+// TestEnvironmentPrepareFailureIsNotAutoRetried pins the retry posture for
+// #7913. The reason moved out of agent_error.* purely so the label is honest —
+// it must not quietly buy the failure a retry it never had. Its causes are the
+// host's: a full volume, a denied permission, a directory another process
+// holds. None of them changes because Multica asked a second time, and
+// preparation already waits out the one transient case it knows about (a prior
+// run still holding the directory) before it fails.
+//
+// Resume stays safe: the agent process never started, so the session the user's
+// next message resumes is untouched.
+func TestEnvironmentPrepareFailureIsNotAutoRetried(t *testing.T) {
+	const reason = "environment_prepare_failed"
+
+	if retryableReasons[reason] {
+		t.Errorf("retryableReasons[%q] = true, want false: the disk or permission problem is the same on the next attempt", reason)
+	}
+	if resumeUnsafeFailureReason(reason) {
+		t.Errorf("resumeUnsafeFailureReason(%q) = true, want false: the agent never started", reason)
 	}
 }
 

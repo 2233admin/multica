@@ -38,6 +38,14 @@ func (e SignupError) Error() string {
 var ErrSignupProhibited = SignupError{Message: "user registration is disabled on this self-hosted instance"}
 var ErrEmailNotAllowed = SignupError{Message: "email address or domain not allowed on this instance"}
 
+const (
+	googleLoginCodeAccountDisabled     = "account_disabled"
+	googleLoginCodeSignupProhibited    = "signup_prohibited"
+	googleLoginCodeEmailNotAllowed     = "email_not_allowed"
+	googleLoginCodeAccountWithoutEmail = "google_account_no_email"
+	googleLoginCodeInvalidOAuthCode    = "oauth_code_invalid"
+)
+
 const devVerificationCodeEnv = "MULTICA_DEV_VERIFICATION_CODE"
 
 // supportedLanguages mirrors `SUPPORTED_LOCALES` in packages/core/i18n/types.ts.
@@ -260,7 +268,7 @@ func (h *Handler) checkSignupAllowed(email string, isNewUser bool) error {
 
 	// 4. if allowlists are set but didn't match, block
 	if len(h.cfg.AllowedEmailDomains) > 0 || len(h.cfg.AllowedEmails) > 0 {
-		return ErrSignupProhibited
+		return ErrEmailNotAllowed
 	}
 
 	return nil
@@ -491,6 +499,283 @@ type googleUserInfo struct {
 	Picture string `json:"picture"`
 }
 
+type GiteaLoginRequest struct {
+	Code  string `json:"code"`
+	State string `json:"state"`
+}
+
+type giteaTokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+}
+
+type giteaUserInfo struct {
+	ID        int64  `json:"id"`
+	Email     string `json:"email"`
+	FullName  string `json:"full_name"`
+	Login     string `json:"login"`
+	AvatarURL string `json:"avatar_url"`
+}
+
+type giteaEmailInfo struct {
+	Email    string `json:"email"`
+	Primary  bool   `json:"primary"`
+	Verified bool   `json:"verified"`
+}
+
+// GiteaStart begins an OAuth transaction. The state and PKCE verifier remain
+// server-controlled; the browser only carries the signed state back from
+// Gitea.
+func (h *Handler) GiteaStart(w http.ResponseWriter, r *http.Request) {
+	clientID := strings.TrimSpace(os.Getenv("GITEA_CLIENT_ID"))
+	clientSecret := strings.TrimSpace(os.Getenv("GITEA_CLIENT_SECRET"))
+	issuer, err := giteaIssuerURL()
+	if clientID == "" || clientSecret == "" || err != nil {
+		writeError(w, http.StatusServiceUnavailable, "Gitea login is not configured")
+		return
+	}
+	redirectURI, err := giteaRedirectURI()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	state, cookieValue, verifier, err := newGiteaOAuthState(r.URL.Query().Get("state"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	auth.SetOAuthStateCookie(w, cookieValue, giteaOAuthStateTTL)
+	http.Redirect(w, r, giteaAuthorizeURL(issuer, clientID, redirectURI, state, giteaPKCEChallenge(verifier)), http.StatusFound)
+}
+
+// GiteaLogin exchanges a Gitea OAuth authorization code and then enters the
+// same Multica user/JWT/cookie path as email and Google login.
+func (h *Handler) GiteaLogin(w http.ResponseWriter, r *http.Request) {
+	var req GiteaLoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.Code) == "" {
+		writeError(w, http.StatusBadRequest, "code is required")
+		return
+	}
+
+	clientID := strings.TrimSpace(os.Getenv("GITEA_CLIENT_ID"))
+	clientSecret := strings.TrimSpace(os.Getenv("GITEA_CLIENT_SECRET"))
+	issuer, err := giteaIssuerURL()
+	if clientID == "" || clientSecret == "" || err != nil {
+		writeError(w, http.StatusServiceUnavailable, "Gitea login is not configured")
+		return
+	}
+
+	if strings.TrimSpace(req.State) == "" {
+		writeError(w, http.StatusBadRequest, "state is required")
+		return
+	}
+	verifier, err := validateGiteaOAuthState(r, req.State)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	redirectURI, err := giteaRedirectURI()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	auth.ClearOAuthStateCookie(w)
+
+	tokenRequest, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
+		giteaBackendURL("/login/oauth/access_token"), strings.NewReader(url.Values{
+			"code":          {req.Code},
+			"client_id":     {clientID},
+			"client_secret": {clientSecret},
+			"redirect_uri":  {redirectURI},
+			"code_verifier": {verifier},
+			"grant_type":    {"authorization_code"},
+		}.Encode()))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	tokenRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenRequest.Header.Set("Accept", "application/json")
+	tokenResp, err := giteaHTTPClient().Do(tokenRequest)
+	if err != nil {
+		slog.Error("gitea oauth token exchange failed", "error", err)
+		writeError(w, http.StatusBadGateway, "failed to exchange code with Git server")
+		return
+	}
+	defer tokenResp.Body.Close()
+	tokenBody, err := io.ReadAll(tokenResp.Body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "failed to read Git token response")
+		return
+	}
+	if tokenResp.StatusCode < http.StatusOK || tokenResp.StatusCode >= http.StatusMultipleChoices {
+		slog.Error("gitea oauth token exchange returned error", "status", tokenResp.StatusCode)
+		if tokenResp.StatusCode == http.StatusBadRequest {
+			writeError(w, http.StatusBadRequest, "failed to exchange code with Git server")
+		} else {
+			writeError(w, http.StatusBadGateway, "failed to exchange code with Git server")
+		}
+		return
+	}
+
+	var gToken giteaTokenResponse
+	if err := json.Unmarshal(tokenBody, &gToken); err != nil {
+		values, parseErr := url.ParseQuery(string(tokenBody))
+		if parseErr != nil {
+			writeError(w, http.StatusBadGateway, "failed to parse Git token response")
+			return
+		}
+		gToken.AccessToken = values.Get("access_token")
+		gToken.TokenType = values.Get("token_type")
+	}
+	if strings.TrimSpace(gToken.AccessToken) == "" {
+		writeError(w, http.StatusBadGateway, "Git token response has no access token")
+		return
+	}
+
+	userInfoReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, giteaBackendURL("/api/v1/user"), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	userInfoReq.Header.Set("Authorization", "Bearer "+gToken.AccessToken)
+	userInfoReq.Header.Set("Accept", "application/json")
+	userInfoResp, err := giteaHTTPClient().Do(userInfoReq)
+	if err != nil {
+		slog.Error("gitea user info fetch failed", "error", err)
+		writeError(w, http.StatusBadGateway, "failed to fetch Git user info")
+		return
+	}
+	defer userInfoResp.Body.Close()
+	if userInfoResp.StatusCode != http.StatusOK {
+		writeError(w, http.StatusBadGateway, "Git server rejected the access token")
+		return
+	}
+	var gUser giteaUserInfo
+	if err := json.NewDecoder(userInfoResp.Body).Decode(&gUser); err != nil {
+		writeError(w, http.StatusBadGateway, "failed to parse Git user info")
+		return
+	}
+	if gUser.ID <= 0 {
+		writeError(w, http.StatusBadGateway, "Git user response has no stable ID")
+		return
+	}
+
+	subject := fmt.Sprintf("%d", gUser.ID)
+	user, err := h.findGiteaUserByIdentity(r.Context(), issuer.String(), subject)
+	isNew := false
+	if err != nil {
+		if !isNotFound(err) {
+			writeError(w, http.StatusInternalServerError, "failed to load Git identity")
+			return
+		}
+
+		email, emailErr := fetchGiteaPrimaryEmail(r.Context(), gToken.AccessToken)
+		if emailErr != nil {
+			if errors.Is(emailErr, errGiteaNoVerifiedPrimaryEmail) {
+				writeError(w, http.StatusBadRequest, emailErr.Error())
+			} else {
+				writeError(w, http.StatusBadGateway, emailErr.Error())
+			}
+			return
+		}
+		user, isNew, err = h.findOrCreateGiteaUser(r.Context(), issuer.String(), subject, email)
+		if err != nil {
+			if errors.Is(err, errGiteaIdentityAlreadyLinked) {
+				writeError(w, http.StatusConflict, err.Error())
+				return
+			}
+			if errors.Is(err, auth.ErrTemporarilyDisabledUser) {
+				writeError(w, http.StatusForbidden, auth.TemporarilyDisabledUserError)
+				return
+			}
+			var signupErr SignupError
+			if errors.As(err, &signupErr) {
+				writeError(w, http.StatusForbidden, signupErr.Error())
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "failed to create user")
+			return
+		}
+	}
+	if isNew {
+		evt := analytics.Signup(uuidToString(user.ID), user.Email, signupSourceFromRequest(r))
+		evt.Properties["auth_method"] = "gitea"
+		obsmetrics.RecordEvent(h.Analytics, h.Metrics, evt)
+	}
+
+	needsUpdate := false
+	newName := user.Name
+	newAvatar := user.AvatarUrl
+	if profileName := strings.TrimSpace(gUser.FullName); profileName != "" && user.Name == strings.Split(user.Email, "@")[0] {
+		newName = profileName
+		needsUpdate = true
+	} else if login := strings.TrimSpace(gUser.Login); login != "" && user.Name == strings.Split(user.Email, "@")[0] {
+		newName = login
+		needsUpdate = true
+	}
+	if gUser.AvatarURL != "" && !user.AvatarUrl.Valid {
+		newAvatar = pgtype.Text{String: gUser.AvatarURL, Valid: true}
+		needsUpdate = true
+	}
+	if needsUpdate {
+		if updated, updateErr := h.Queries.UpdateUser(r.Context(), db.UpdateUserParams{ID: user.ID, Name: newName, AvatarUrl: newAvatar}); updateErr == nil {
+			user = updated
+		}
+	}
+
+	tokenString, err := h.issueJWT(user)
+	if err != nil {
+		if errors.Is(err, auth.ErrTemporarilyDisabledUser) {
+			writeError(w, http.StatusForbidden, auth.TemporarilyDisabledUserError)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to generate token")
+		return
+	}
+	if err := auth.SetAuthCookies(w, tokenString); err != nil {
+		slog.Warn("failed to set auth cookies", "error", err)
+	}
+	if h.CFSigner != nil {
+		for _, cookie := range h.CFSigner.SignedCookies(time.Now().Add(auth.AuthTokenTTL())) {
+			http.SetCookie(w, cookie)
+		}
+	}
+
+	slog.Info("user logged in via gitea", append(logger.RequestAttrs(r), "user_id", uuidToString(user.ID), "email", user.Email)...)
+	writeJSON(w, http.StatusOK, LoginResponse{Token: tokenString, User: h.userToResponse(user)})
+}
+
+func writeGoogleLoginActionableError(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, auth.ErrTemporarilyDisabledUser):
+		writeErrorCode(w, http.StatusForbidden, googleLoginCodeAccountDisabled, auth.TemporarilyDisabledUserError)
+	case errors.Is(err, ErrSignupProhibited):
+		writeErrorCode(w, http.StatusForbidden, googleLoginCodeSignupProhibited, ErrSignupProhibited.Error())
+	case errors.Is(err, ErrEmailNotAllowed):
+		writeErrorCode(w, http.StatusForbidden, googleLoginCodeEmailNotAllowed, ErrEmailNotAllowed.Error())
+	default:
+		var signupErr SignupError
+		if !errors.As(err, &signupErr) {
+			return false
+		}
+		// Preserve the actionable fallback for signup restrictions without a code.
+		writeError(w, http.StatusForbidden, signupErr.Error())
+	}
+	return true
+}
+
+func (h *Handler) googleHTTPClient() *http.Client {
+	if h.googleOAuthHTTPClient != nil {
+		return h.googleOAuthHTTPClient
+	}
+	return http.DefaultClient
+}
+
 func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
 	var req GoogleLoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -516,7 +801,7 @@ func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Exchange authorization code for tokens.
-	tokenResp, err := http.PostForm("https://oauth2.googleapis.com/token", url.Values{
+	tokenResp, err := h.googleHTTPClient().PostForm("https://oauth2.googleapis.com/token", url.Values{
 		"code":          {req.Code},
 		"client_id":     {clientID},
 		"client_secret": {clientSecret},
@@ -538,13 +823,28 @@ func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
 
 	if tokenResp.StatusCode != http.StatusOK {
 		slog.Error("google oauth token exchange returned error", "status", tokenResp.StatusCode, "body", string(tokenBody))
-		writeError(w, http.StatusBadRequest, "failed to exchange code with Google")
+		var tokenErr struct {
+			Error string `json:"error"`
+		}
+		// Only a valid invalid_grant response identifies a rejected authorization
+		// code. Configuration, provider and malformed responses are server failures.
+		if err := json.Unmarshal(tokenBody, &tokenErr); err == nil &&
+			tokenResp.StatusCode == http.StatusBadRequest && tokenErr.Error == "invalid_grant" {
+			writeErrorCode(w, http.StatusBadRequest, googleLoginCodeInvalidOAuthCode, "failed to exchange code with Google")
+			return
+		}
+		writeError(w, http.StatusBadGateway, "failed to exchange code with Google")
 		return
 	}
 
 	var gToken googleTokenResponse
 	if err := json.Unmarshal(tokenBody, &gToken); err != nil {
 		writeError(w, http.StatusBadGateway, "failed to parse Google token response")
+		return
+	}
+	if strings.TrimSpace(gToken.AccessToken) == "" {
+		slog.Error("google oauth token response has no access token")
+		writeError(w, http.StatusBadGateway, "invalid Google token response")
 		return
 	}
 
@@ -557,7 +857,7 @@ func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	userInfoReq.Header.Set("Authorization", "Bearer "+gToken.AccessToken)
 
-	userInfoResp, err := http.DefaultClient.Do(userInfoReq)
+	userInfoResp, err := h.googleHTTPClient().Do(userInfoReq)
 	if err != nil {
 		slog.Error("google userinfo fetch failed", "error", err)
 		writeError(w, http.StatusBadGateway, "failed to fetch user info from Google")
@@ -565,32 +865,41 @@ func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	defer userInfoResp.Body.Close()
 
-	var gUser googleUserInfo
+	if userInfoResp.StatusCode != http.StatusOK {
+		body, readErr := io.ReadAll(io.LimitReader(userInfoResp.Body, 4096))
+		if readErr != nil {
+			slog.Error("google userinfo error response could not be read", "status", userInfoResp.StatusCode, "error", readErr)
+		} else {
+			slog.Error("google userinfo returned error", "status", userInfoResp.StatusCode, "body", string(body))
+		}
+		writeError(w, http.StatusBadGateway, "failed to fetch user info from Google")
+		return
+	}
+
+	var gUser *googleUserInfo
 	if err := json.NewDecoder(userInfoResp.Body).Decode(&gUser); err != nil {
 		writeError(w, http.StatusBadGateway, "failed to parse Google user info")
 		return
 	}
-
-	if gUser.Email == "" {
-		writeError(w, http.StatusBadRequest, "Google account has no email")
+	if gUser == nil {
+		writeError(w, http.StatusBadGateway, "invalid Google user info")
 		return
 	}
 
 	email := strings.ToLower(strings.TrimSpace(gUser.Email))
+	if email == "" {
+		writeErrorCode(w, http.StatusBadRequest, googleLoginCodeAccountWithoutEmail, "Google did not provide an email address for this sign-in")
+		return
+	}
+
 	if auth.IsTemporarilyDisabledUserEmail(email) {
-		writeError(w, http.StatusForbidden, auth.TemporarilyDisabledUserError)
+		writeErrorCode(w, http.StatusForbidden, googleLoginCodeAccountDisabled, auth.TemporarilyDisabledUserError)
 		return
 	}
 
 	user, isNew, err := h.findOrCreateUser(r.Context(), email)
 	if err != nil {
-		if errors.Is(err, auth.ErrTemporarilyDisabledUser) {
-			writeError(w, http.StatusForbidden, auth.TemporarilyDisabledUserError)
-			return
-		}
-		var signupErr SignupError
-		if errors.As(err, &signupErr) {
-			writeError(w, http.StatusForbidden, signupErr.Error())
+		if writeGoogleLoginActionableError(w, err) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to create user")
@@ -630,8 +939,7 @@ func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
 
 	tokenString, err := h.issueJWT(user)
 	if err != nil {
-		if errors.Is(err, auth.ErrTemporarilyDisabledUser) {
-			writeError(w, http.StatusForbidden, auth.TemporarilyDisabledUserError)
+		if writeGoogleLoginActionableError(w, err) {
 			return
 		}
 		slog.Warn("google login failed", append(logger.RequestAttrs(r), "error", err, "email", email)...)

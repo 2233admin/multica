@@ -22,9 +22,11 @@ type AppConfig struct {
 	CdnSigned bool `json:"cdn_signed,omitempty"`
 	// Public auth config consumed by the web app at runtime so self-hosted
 	// deployments do not need to rebuild the frontend image when operators
-	// toggle signup or wire Google OAuth.
-	AllowSignup    bool   `json:"allow_signup"`
-	GoogleClientID string `json:"google_client_id,omitempty"`
+	// toggle signup or wire Google/Gitea OAuth. OAuth client secrets never leave
+	// the backend; the Gitea flag is true only when the complete flow is usable.
+	AllowSignup       bool   `json:"allow_signup"`
+	GoogleClientID    string `json:"google_client_id,omitempty"`
+	GiteaLoginEnabled bool   `json:"gitea_login_enabled,omitempty"`
 	// WorkspaceCreationDisabled mirrors the server-side
 	// DISABLE_WORKSPACE_CREATION env var so the UI can hide every
 	// "Create workspace" affordance on self-hosted instances. Omitted
@@ -75,6 +77,12 @@ type AppConfig struct {
 	// them, and only one of the two guesses is safe.
 	LocalWorktreeSupported bool `json:"local_worktree_supported"`
 
+	// AgentConversationStartersSupported tells independently deployed clients
+	// that agent create/update persists conversation_starters. Older handlers
+	// ignored the unknown JSON field and still returned success, so clients
+	// must fail closed when this declaration is absent.
+	AgentConversationStartersSupported bool `json:"agent_conversation_starters_supported"`
+
 	// ServerVersion is the running API build version, so self-hosted
 	// operators can confirm what's deployed and include it in bug reports.
 	// Only emitted on self-hosted deployments — omitted on the managed cloud,
@@ -91,11 +99,17 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 	config := AppConfig{
 		// A property of this build, not of the deployment: if this code is
 		// running, the save gate is running with it.
-		LocalWorktreeSupported:    true,
-		AllowSignup:               os.Getenv("ALLOW_SIGNUP") != "false",
-		GoogleClientID:            os.Getenv("GOOGLE_CLIENT_ID"),
-		WorkspaceCreationDisabled: os.Getenv("DISABLE_WORKSPACE_CREATION") == "true",
+		LocalWorktreeSupported:             true,
+		AgentConversationStartersSupported: true,
+		AllowSignup:                        os.Getenv("ALLOW_SIGNUP") != "false",
+		GoogleClientID:                     os.Getenv("GOOGLE_CLIENT_ID"),
+		WorkspaceCreationDisabled:          os.Getenv("DISABLE_WORKSPACE_CREATION") == "true",
 	}
+	_, issuerErr := giteaIssuerURL()
+	_, redirectErr := giteaRedirectURI()
+	config.GiteaLoginEnabled = issuerErr == nil && redirectErr == nil &&
+		strings.TrimSpace(os.Getenv("GITEA_CLIENT_ID")) != "" &&
+		strings.TrimSpace(os.Getenv("GITEA_CLIENT_SECRET")) != ""
 	if h.Storage != nil {
 		config.CdnDomain = h.Storage.CdnDomain()
 	}
@@ -125,7 +139,10 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func daemonSetupURLsFromEnv() (string, string) {
-	serverURL := normalizePublicURL(os.Getenv("MULTICA_PUBLIC_URL"))
+	serverURL := normalizePublicURL(os.Getenv("MULTICA_DAEMON_SERVER_URL"))
+	if serverURL == "" {
+		serverURL = normalizePublicURL(os.Getenv("MULTICA_PUBLIC_URL"))
+	}
 	appURL := resolveFrontendAppURL()
 	if appURL == "" {
 		return "", ""

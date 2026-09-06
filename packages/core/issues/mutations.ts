@@ -7,6 +7,7 @@ import { inboxKeys } from "../inbox/queries";
 import {
   applyIssueChange,
   invalidateIssueDerivatives,
+  invalidateLastActivitySortedIssueLists,
   invalidateStaleListKeys,
   rollbackIssueChange,
   type IssueFlatCache,
@@ -28,6 +29,7 @@ import { useRecentContextStore } from "../chat/recent-context-store";
 import { useRecentIssuesStore } from "./stores";
 import type { InboxItem, Issue, IssueReaction } from "../types";
 import type {
+  CreateCommentSubIssueManualRequest,
   CreateIssueRequest,
   ListIssuesCache,
   MoveIssueRequest,
@@ -35,6 +37,11 @@ import type {
 } from "../types";
 import type { TimelineEntry, IssueSubscriber, Reaction } from "../types";
 import { sortTimelineEntriesAsc } from "./timeline-sort";
+import {
+  onIssueAuxiliaryRevision,
+  invalidateIssueOwnerProjections,
+  reconcileIssueFullSnapshotRevision,
+} from "./ws-updaters";
 
 // ---------------------------------------------------------------------------
 // Shared mutation variable types — used by both mutation hooks and
@@ -69,11 +76,13 @@ export type UpdateIssueMutationInput = {
 // Issue CRUD
 // ---------------------------------------------------------------------------
 
-export function useCreateIssue() {
+function useIssueCreateMutation<TVariables>(
+  mutationFn: (variables: TVariables) => Promise<Issue>,
+) {
   const qc = useQueryClient();
   const wsId = useWorkspaceId();
   return useMutation({
-    mutationFn: (data: CreateIssueRequest) => api.createIssue(data),
+    mutationFn,
     onSuccess: (newIssue) => {
       for (const [key, data] of qc.getQueriesData<ListIssuesCache>({ queryKey: issueKeys.list(wsId) })) {
         if (data) qc.setQueryData<ListIssuesCache>(key, addIssueToBuckets(data, newIssue));
@@ -99,6 +108,20 @@ export function useCreateIssue() {
   });
 }
 
+export function useCreateIssue() {
+  return useIssueCreateMutation((data: CreateIssueRequest) => api.createIssue(data));
+}
+
+export function useCreateCommentSubIssue() {
+  return useIssueCreateMutation(({
+    anchorCommentId,
+    data,
+  }: {
+    anchorCommentId: string;
+    data: CreateCommentSubIssueManualRequest;
+  }) => api.createCommentSubIssue(anchorCommentId, data));
+}
+
 export function useUpdateIssue() {
   const qc = useQueryClient();
   const wsId = useWorkspaceId();
@@ -109,17 +132,18 @@ export function useUpdateIssue() {
       return api.moveIssue(id, { ...target, ...moveIntent });
     },
     onMutate: ({ id, move_intent: _moveIntent, ...data }) => {
-      // suppress_run / handoff_note are write-time control fields, not Issue
-      // columns. description_base is merge metadata, while description itself
+      // suppress_run is a write-time control field, not an Issue column.
+      // description_base is merge metadata, while description itself
       // is resolved against that base on the server and therefore is not safe
       // to predict optimistically. Keep the authoritative raw description in
       // cache so hidden channel-media markers remain available as the base for
       // a rapid follow-up edit. mutationFn still sends the full payload.
       const {
         suppress_run: _suppressRun,
-        handoff_note: _handoffNote,
         description: _description,
         description_base: _descriptionBase,
+        title_base: _titleBase,
+        expected_revision: _expectedRevision,
         ...patch
       } = data;
       // Fire-and-forget cancelQueries — keeps onMutate synchronous so the
@@ -130,8 +154,8 @@ export function useUpdateIssue() {
       qc.cancelQueries({ queryKey: issueKeys.myAll(wsId) });
       qc.cancelQueries({ queryKey: issueKeys.flatAll(wsId) });
       qc.cancelQueries({ queryKey: issueKeys.tableAll(wsId) });
-      if (patch.status !== undefined) {
-        qc.cancelQueries({ queryKey: inboxKeys.list(wsId) });
+      if (patch.status !== undefined || patch.priority !== undefined) {
+        qc.cancelQueries({ queryKey: inboxKeys.all(wsId) });
       }
       const prevDetail = qc.getQueryData<Issue>(issueKeys.detail(wsId, id));
       // The coordinator owns the cross-cache rules: surgical patch/rebucket
@@ -190,7 +214,7 @@ export function useUpdateIssue() {
       }
       return { change, prevChildren, parentId, id };
     },
-    onError: (_err, _vars, ctx) => {
+    onError: (_err, vars, ctx) => {
       if (ctx) {
         rollbackIssueChange(qc, wsId, ctx.id, ctx.change);
       }
@@ -200,6 +224,16 @@ export function useUpdateIssue() {
           ctx.prevChildren,
         );
       }
+      // A remote revision may have landed through WS after onMutate captured
+      // its rollback snapshot. Restoring that snapshot on any failed request
+      // can therefore transiently put an older entity back into cache; refresh
+      // every loaded owner projection after rollback. A revision conflict is
+      // the common case, but transport/5xx failures have the same interleave.
+      qc.invalidateQueries({ queryKey: issueKeys.detail(wsId, vars.id) });
+      qc.invalidateQueries({ queryKey: issueKeys.list(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.myAll(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.flatAll(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.tableAll(wsId) });
     },
     onSuccess: (serverIssue, vars) => {
       // Reconcile with the authoritative server entity by patching the one card
@@ -216,7 +250,6 @@ export function useUpdateIssue() {
       // is the plain surgical patch it always was.
       const {
         suppress_run: _suppressRun,
-        handoff_note: _handoffNote,
         description_base: _descriptionBase,
         move_intent: _moveIntent,
         id: _id,
@@ -231,7 +264,21 @@ export function useUpdateIssue() {
       const reconcile = applyIssueChange(qc, wsId, serverIssue.id, reconcilable as typeof serverIssue, {
         changed: issueChangedDims(intent, serverIssue),
         baseIssue: serverIssue,
+        // The HTTP response can arrive after a newer WS event. Reconcile the
+        // committed snapshot only into projections that have not already
+        // advanced beyond it; otherwise an older successful response would
+        // undo a later remote write in cache.
+        acceptCurrent: (current) =>
+          current.revision === undefined ||
+          (serverIssue.revision !== undefined &&
+            serverIssue.revision > current.revision),
       });
+      reconcileIssueFullSnapshotRevision(
+        qc,
+        wsId,
+        serverIssue.id,
+        serverIssue.revision,
+      );
       // The server has committed — safe to flush any drift it reported now.
       invalidateStaleListKeys(qc, reconcile.staleKeys);
     },
@@ -396,7 +443,6 @@ export function useBatchUpdateIssues() {
       // until a refetch returns the committed result.
       const {
         suppress_run: _suppressRun,
-        handoff_note: _handoffNote,
         description: _description,
         description_base: _descriptionBase,
         ...patch
@@ -405,8 +451,8 @@ export function useBatchUpdateIssues() {
       await qc.cancelQueries({ queryKey: issueKeys.myAll(wsId) });
       await qc.cancelQueries({ queryKey: issueKeys.flatAll(wsId) });
       await qc.cancelQueries({ queryKey: issueKeys.tableAll(wsId) });
-      if (patch.status !== undefined) {
-        await qc.cancelQueries({ queryKey: inboxKeys.list(wsId) });
+      if (patch.status !== undefined || patch.priority !== undefined) {
+        await qc.cancelQueries({ queryKey: inboxKeys.all(wsId) });
       }
 
       // Run every issue through the coordinator — the same rules table the
@@ -423,6 +469,7 @@ export function useBatchUpdateIssues() {
       >();
       const prevDetailById = new Map<string, Issue>();
       let prevInboxList: InboxItem[] | undefined;
+      let prevArchivedInboxList: InboxItem[] | undefined;
       const staleKeys: QueryKey[] = [];
       for (const id of ids) {
         const base = qc.getQueryData<Issue>(issueKeys.detail(wsId, id));
@@ -449,6 +496,12 @@ export function useBatchUpdateIssues() {
         if (change.prevDetail) prevDetailById.set(id, change.prevDetail);
         if (prevInboxList === undefined && change.prevInboxList !== undefined) {
           prevInboxList = change.prevInboxList;
+        }
+        if (
+          prevArchivedInboxList === undefined &&
+          change.prevArchivedInboxList !== undefined
+        ) {
+          prevArchivedInboxList = change.prevArchivedInboxList;
         }
         staleKeys.push(...change.staleKeys);
       }
@@ -478,6 +531,7 @@ export function useBatchUpdateIssues() {
         prevTableRows: [...prevTableRowByHash.values()],
         prevDetailById,
         prevInboxList,
+        prevArchivedInboxList,
         staleKeys,
         prevChildren,
         affectedParentIds,
@@ -506,6 +560,12 @@ export function useBatchUpdateIssues() {
       }
       if (ctx?.prevInboxList !== undefined) {
         qc.setQueryData(inboxKeys.list(wsId), ctx.prevInboxList);
+      }
+      if (ctx?.prevArchivedInboxList !== undefined) {
+        qc.setQueryData(
+          inboxKeys.archived(wsId),
+          ctx.prevArchivedInboxList,
+        );
       }
       if (ctx?.prevChildren) {
         for (const [parentId, snapshot] of ctx.prevChildren) {
@@ -685,6 +745,7 @@ type TimelineCache = TimelineEntry[];
 
 export function useCreateComment(issueId: string) {
   const qc = useQueryClient();
+  const wsId = useWorkspaceId();
   return useMutation({
     mutationFn: ({
       content,
@@ -700,6 +761,12 @@ export function useCreateComment(issueId: string) {
       suppressAgentIds?: string[];
     }) => api.createComment(issueId, content, type, parentId, attachmentIds, suppressAgentIds),
     onSuccess: (comment) => {
+      if (comment.issue_revision) {
+        onIssueAuxiliaryRevision(qc, wsId, issueId, comment.issue_revision);
+      } else {
+        invalidateIssueOwnerProjections(qc, wsId, issueId);
+      }
+      invalidateLastActivitySortedIssueLists(qc, wsId);
       const entry: TimelineEntry = {
         type: "comment",
         id: comment.id,
@@ -738,18 +805,23 @@ export function useCreateComment(issueId: string) {
 
 export function useUpdateComment(issueId: string) {
   const qc = useQueryClient();
+  const wsId = useWorkspaceId();
   return useMutation({
     mutationFn: ({
       commentId,
       content,
       attachmentIds,
       suppressAgentIds,
+      contentBase,
+      expectedRevision,
     }: {
       commentId: string;
       content: string;
       attachmentIds: string[];
       suppressAgentIds?: string[];
-    }) => api.updateComment(commentId, content, attachmentIds, suppressAgentIds),
+      contentBase?: string;
+      expectedRevision?: number;
+    }) => api.updateComment(commentId, content, attachmentIds, suppressAgentIds, contentBase, expectedRevision),
     onMutate: async ({ commentId, content, attachmentIds }) => {
       await qc.cancelQueries({ queryKey: issueKeys.timeline(issueId) });
       const prev = qc.getQueryData<TimelineCache>(issueKeys.timeline(issueId));
@@ -768,6 +840,16 @@ export function useUpdateComment(issueId: string) {
         qc.setQueryData(issueKeys.timeline(issueId), ctx.prev);
       }
     },
+    onSuccess: (comment) => {
+      if (comment.issue_revision) {
+        onIssueAuxiliaryRevision(qc, wsId, issueId, comment.issue_revision);
+      } else {
+        // Mixed-version fallback: an older backend may have committed the
+        // aggregate revision without returning it.
+        invalidateIssueOwnerProjections(qc, wsId, issueId);
+      }
+      invalidateLastActivitySortedIssueLists(qc, wsId);
+    },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: issueKeys.timeline(issueId) });
     },
@@ -776,6 +858,7 @@ export function useUpdateComment(issueId: string) {
 
 export function useDeleteComment(issueId: string) {
   const qc = useQueryClient();
+  const wsId = useWorkspaceId();
   return useMutation({
     mutationFn: (commentId: string) => api.deleteComment(commentId),
     onMutate: async (commentId) => {
@@ -810,6 +893,13 @@ export function useDeleteComment(issueId: string) {
       if (ctx?.prev !== undefined) {
         qc.setQueryData(issueKeys.timeline(issueId), ctx.prev);
       }
+    },
+    onSuccess: () => {
+      // The endpoint remains 204 for compatibility, so the local caller has
+      // no body carrying issue_revision. The realtime event will narrow this
+      // with its revision when connected; this is the no-WS safety net.
+      invalidateIssueOwnerProjections(qc, wsId, issueId);
+      invalidateLastActivitySortedIssueLists(qc, wsId);
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: issueKeys.timeline(issueId) });
@@ -933,6 +1023,7 @@ export function useToggleCommentReaction(issueId: string) {
 
 export function useToggleIssueReaction(issueId: string) {
   const qc = useQueryClient();
+  const wsId = useWorkspaceId();
   return useMutation({
     mutationKey: ["toggleIssueReaction", issueId] as const,
     mutationFn: async ({
@@ -944,6 +1035,9 @@ export function useToggleIssueReaction(issueId: string) {
         return null;
       }
       return api.addIssueReaction(issueId, emoji);
+    },
+    onSuccess: (reaction) => {
+      onIssueAuxiliaryRevision(qc, wsId, issueId, reaction?.issue_revision);
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: issueKeys.reactions(issueId) });

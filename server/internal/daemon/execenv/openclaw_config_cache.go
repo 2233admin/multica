@@ -15,8 +15,8 @@ import (
 )
 
 // OpenClaw config discovery costs two serial CLI round-trips per task
-// preparation in the common case (`config file`, then
-// `config get agents.list --json`; see openclawMaxCLICallsPerPreparation for
+// preparation in the common case (`config validate --json`, then
+// `config get agents.list --json`; see openclawMaxCLIDeadlinesPerPreparation for
 // the worst case). On a fast host that is ~1s total; on the Intel Mac in #7112
 // it is ~12.7s, and it is paid again for every task — including every chat
 // message, because Reuse runs the same preparation path as Prepare. Raising
@@ -28,11 +28,11 @@ import (
 // (PrepareIsolated / ReuseIsolated), so an in-process cache would never
 // survive to the next task.
 //
-// What is NOT cached: the fully resolved config read by
-// openclawResolvedFullConfig. That payload carries the user's API keys and
-// model-provider tokens, and copying it into a long-lived shared file is a
-// secret-spill surface the wrapper flow does not need — that call already
-// only happens for agents with a managed mcp_config.
+// What is NOT cached, and no longer exists to cache: the resolved config read
+// this flow used to make for a managed mcp_config. Managed MCP is now prepared
+// from a reset stage this package writes, so there is no per-agent CLI payload on
+// this path at all — one fewer thing whose staleness would have to be reasoned
+// about, and one fewer copy of the user's configuration anywhere.
 const (
 	// openclawDiscoveryCacheFile is the per-profile cache file name. It sits
 	// in the profile directory (~/.multica[/profiles/<name>]) so every task on
@@ -51,6 +51,22 @@ const (
 	// config file. The TTL is the backstop that keeps those visible, at the
 	// cost of re-running discovery at most once a minute.
 	openclawDiscoveryCacheTTL = time.Minute
+
+	// openclawDiscoveryCacheFutureSkew is how far ahead of the reader's clock
+	// sample an entry may be dated and still count as fresh.
+	//
+	// Without it, tasks starting together on one daemon evict each other's
+	// work. Every caller samples time.Now() once and passes it down, so a peer
+	// that sampled later but committed its rename first leaves an entry dated
+	// microseconds "in the future" — and the reader, whose own store just
+	// succeeded, throws it away and re-runs discovery for nothing. The same
+	// interleaving is what made TestOpenclawDiscoveryCacheConcurrentPreparations
+	// flake in CI.
+	//
+	// One second is far above that window and far below what the guard below
+	// exists to catch. It also bounds the cost of being wrong: an entry dated
+	// into the future outlives its TTL by at most this much.
+	openclawDiscoveryCacheFutureSkew = time.Second
 )
 
 // openclawDiscoveryFingerprint is the "is this entry still true?" evidence
@@ -208,10 +224,13 @@ func loadOpenclawDiscoveryCache(cachePath, bin string, now time.Time) (openclawD
 		return openclawDiscoveryCacheEntry{}, false
 	}
 	age := now.Sub(time.Unix(0, entry.CachedAtNano))
-	// A negative age means the entry was written in the future — a clock jump
-	// or a hand-edited file. Treat it as a miss rather than trusting it for a
-	// TTL that may never expire.
-	if age < 0 || age > openclawDiscoveryCacheTTL {
+	// An age well below zero means the entry was written in the future — a
+	// clock jump or a hand-edited file. Treat it as a miss rather than trusting
+	// it for a TTL that may never expire. Sub-second future dating is not that:
+	// it is the ordinary result of a concurrent writer on this same daemon
+	// (see openclawDiscoveryCacheFutureSkew), and rejecting it only buys an
+	// unnecessary discovery run.
+	if age < -openclawDiscoveryCacheFutureSkew || age > openclawDiscoveryCacheTTL {
 		return openclawDiscoveryCacheEntry{}, false
 	}
 	current, err := buildOpenclawDiscoveryFingerprint(bin, entry.ActiveConfigPath)
