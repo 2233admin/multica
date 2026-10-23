@@ -1,0 +1,6 @@
+-- Intentionally empty. The up is a convergence step ("ensure the legacy 433
+-- constraints and index are gone") whose effect is conditional (IF EXISTS), so
+-- it has no single inverse: a database first migrated with the FK-free 433
+-- never had them, and re-adding the foreign key would contradict the no-FK
+-- rule. The 990001 / 990002 unique indexes keep the same uniqueness guarantees.
+-- Full rollback drops the table via 433's down migration.

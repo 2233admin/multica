@@ -66,6 +66,8 @@ const (
 	// Anything shorter is clamped up rather than honoured, because honouring
 	// it would mean silently logging active users out.
 	MinAuthTokenTTL = time.Minute
+	// OAuthStateCookieName holds the short-lived Gitea OAuth transaction (fork).
+	OAuthStateCookieName = "multica_oauth_state"
 )
 
 var (
@@ -327,6 +329,41 @@ func ClearAuthCookies(w http.ResponseWriter) {
 	// Logout must clear BOTH, or a stale session-bound value survives the
 	// logout and is presented alongside the next login's cookies.
 	expire(SessionCSRFCookieName, false)
+}
+
+// SetOAuthStateCookie stores a short-lived OAuth transaction. OAuth providers
+// return to the browser from another site, so this cookie intentionally uses
+// Lax rather than Strict while remaining HttpOnly and host-only by default.
+func SetOAuthStateCookie(w http.ResponseWriter, value string, ttl time.Duration) {
+	secure := isSecureCookie()
+	domain := cookieDomain()
+	now := time.Now()
+	http.SetCookie(w, &http.Cookie{
+		Name:     OAuthStateCookieName,
+		Value:    value,
+		Path:     "/",
+		Domain:   domain,
+		MaxAge:   int(ttl.Seconds()),
+		Expires:  now.Add(ttl),
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// ClearOAuthStateCookie removes the one-time OAuth transaction cookie.
+func ClearOAuthStateCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     OAuthStateCookieName,
+		Value:    "",
+		Path:     "/",
+		Domain:   cookieDomain(),
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+		Secure:   isSecureCookie(),
+		SameSite: http.SameSiteLaxMode,
+	})
 }
 
 // IsSafeMethod reports whether a method is read-only under RFC 9110, i.e. one
